@@ -19,9 +19,9 @@ git push -u origin feature-my-update
 # 常用配套命令
 # 查看当前在哪个分支： git branch（带星号的就是你现在的分支）。
 # 切换回主分支： 
-git checkout main。
+git checkout main
 # 合并分支： 先切换回 main，然后运行 
-git merge feature-my-update。
+git merge feature-my-update
 
 
 # 代码改完了，仅仅在编辑器里 Ctrl+S 是不够的，你还需要告诉 Git 记录下这些变化：
@@ -37,4 +37,4 @@ git add .
 git commit -m "描述你改了什么，例如：优化了机械臂动作预测的扩散步数"
 
 # 上传github
-git merge feature-my-update
+git push -u origin feature-my-update
