@@ -18,10 +18,10 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # === Image Transformations ===
 def build_transform(input_size):
     return T.Compose([
-        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img), # 转 RGB
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC), # resize 到 448 x 448
+        T.ToTensor(), # ToTensor
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD) # ImageNet mean/std normalize
     ])
 
 # === Aspect Ratio Handling ===
@@ -40,6 +40,11 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
     return best_ratio
 
 def dynamic_preprocess(image, min_num=1, max_num=1, image_size=448, use_thumbnail=False):
+    '''
+    function: 将输入图像切分成多个 tile，并调整每个 tile 的大小以适配 InternVL3 的输入要求。切分的方式根据图像的宽高比动态决定，以尽量减少信息损失。切分后的 tile 会被 resize 成指定的 image_size，最后返回一个包含所有 tile 的列表。
+    input: image (PIL.Image) - 输入图像；min_num (int) - 最小切分块数；max_num (int) - 最大切分块数；image_size (int) - 每个 tile 的目标大小；use_thumbnail (bool) - 是否在切分后添加一个缩略图。
+    output: List[PIL.Image] - 切分并调整大小后的图像块
+    '''
     orig_width, orig_height = image.size
     aspect_ratio = orig_width / orig_height
     target_ratios = set(
@@ -75,6 +80,7 @@ class InternVL3Embedder(nn.Module):
         self.image_size = image_size
         self.max_text_length = 1024  # InternVL3 supports up to 1024 tokens
         self.transform = build_transform(image_size)
+        # 加载预训练模型和分词器，设置模型为评估模式，并冻结所有参数以节省内存和计算资源。
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
         self.model = AutoModel.from_pretrained(
             model_name,
@@ -85,23 +91,28 @@ class InternVL3Embedder(nn.Module):
             _fast_init=False,
         ).to(self.device) 
         
+        # hasattr：检查模型是否具有 language_model 属性，如果有则进一步检查是否具有 model 属性，以适配不同版本的 InternVL3 模型结构。
         if hasattr(self.model.language_model, 'model'):
             layers = self.model.language_model.model.layers
 
         else:
             layers = self.model.language_model.layers
+        # 只保留 language model 前 14 层
         layers = layers[:14]
 
         if hasattr(self.model.language_model, 'model'):
             self.model.language_model.model.layers = torch.nn.ModuleList(layers)
         else:
             self.model.language_model.layers = torch.nn.ModuleList(layers)
+        # nn.Identity() 是一个占位符模块，它的 forward 方法直接返回输入，不进行任何修改。
+        # 这里把语言模型的 lm_head 替换成 Identity，意味着我们不使用预训练语言模型的输出层，而是直接使用最后一层的隐藏状态作为视觉语言融合后的特征表示。
+        # 这通常用于下游任务中，我们会在这些隐藏状态上添加自己的头部（比如动作头）来进行特定任务的预测。
         self.model.language_model.lm_head = torch.nn.Identity()
 
         if hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "encoder"):
             self.model.vision_model.encoder.gradient_checkpointing = False
         
-
+    # 图像预处理
     def _preprocess_images(
         self,
         image_tensors: List[Union[Image.Image, torch.Tensor]]
@@ -109,9 +120,12 @@ class InternVL3Embedder(nn.Module):
 
         pixel_values_list = []
         for i, image in enumerate(image_tensors):
+            # 如果输入是 tensor，先转 PIL
             if isinstance(image, torch.Tensor):
                 image = to_pil_image(image)
+            # 对每张图像进行动态切分和预处理，得到一个包含所有 tile 的列表
             tiles = dynamic_preprocess(image, image_size=self.image_size)
+            # transform()调用了build_transform 函数进行预定义的图像变换
             tile_tensors = torch.stack([self.transform(t) for t in tiles])  # (T_i, 3, 448, 448)
             pixel_values_list.append(tile_tensors)
 
@@ -120,6 +134,7 @@ class InternVL3Embedder(nn.Module):
 
         return pixel_values, num_tiles_list
 
+    # prompt 构造：构造一个带图像占位 token 的语言序列，再用视觉特征替换这些占位 token 的 embedding
     def _build_multimodal_prompt(
         self,
         num_tiles_list: List[int],
@@ -127,14 +142,22 @@ class InternVL3Embedder(nn.Module):
     ) -> str:
 
         prompt = ''
+        # 拼出结构：
+        # Image-1: <image>
+        # Image-2: <image>
+        # ...
         for i in range(len(num_tiles_list)):
             prompt += f"Image-{i+1}: <image>\n"
+        # 把文本指令追加到 prompt 的末尾，strip() 去掉首尾空白，确保格式整洁。
         prompt += text_prompt.strip()
 
         IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
         IMG_START_TOKEN = "<img>"
         IMG_END_TOKEN = "</img>"
 
+        # 把每个 <image> 替换成：
+        # <img><IMG_CONTEXT>...<IMG_CONTEXT></img>
+        # 替换数量由 self.model.num_image_token * tile_count 决定。
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         for tile_count in num_tiles_list:
             token_count = self.model.num_image_token * tile_count
@@ -143,6 +166,7 @@ class InternVL3Embedder(nn.Module):
 
         return prompt
     
+    # 视觉特征塞进语言输入
     def _prepare_and_fuse_embeddings(
         self,
         prompt: str,
@@ -151,6 +175,7 @@ class InternVL3Embedder(nn.Module):
         num_tiles_list: List[int]
     ) -> (torch.Tensor, torch.Tensor):
    
+        # 先 tokenizer prompt
         untruncated_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
         true_sequence_length = untruncated_ids.shape[1]
 

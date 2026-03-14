@@ -65,6 +65,18 @@ def inspect_named_submodules(module_dict: dict, verbose: bool = True):
 
 
 def custom_collate_fn(batch):
+    '''
+    该函数把 dataset 产出的样本整理成：
+       - prompts: list of strings
+       - images: 每个样本的多视角图像
+       - states: 机器人状态
+       - actions: 真实动作序列
+       - action_mask: 动作维度有效位
+       - image_masks: 哪些相机视角有效
+       - state_mask: 哪些 state 维度有效
+       - embodiment_ids: 机器人 embodiment 类别
+       [注]：这个项目为了兼容多机器人，把 state/action 都 pad 到统一最大维度，真正有效的部分靠 mask 表示
+    '''
     prompts = [item["prompt"] for item in batch]
     images = [item["images"] for item in batch]
     states = torch.stack([item["state"] for item in batch], dim=0)
@@ -140,15 +152,20 @@ def init_swanlab(config: dict, accelerator: Accelerator):
         )
 
 def prepare_dataset(config: dict) -> torch.utils.data.Dataset:
+    # config: 配置文件，包含各种字段
+    # get_with_warning 作用：
+    # e.g. if "dataset_type" in config, return config["dataset_type"], else return "lerobot" and print warning
     dataset_type = get_with_warning(config, "dataset_type", "lerobot")
     image_size = get_with_warning(config, "image_size", 448)
     max_samples = get_with_warning(config, "max_samples_per_file", None)
     horizon = get_with_warning(config, "horizon", 50)
     binarize_gripper = get_with_warning(config, "binarize_gripper", False)
     use_augmentation = get_with_warning(config, "use_augmentation", False)
+    # lerobot数据集的加载，使用dataset_config_path中的配置来初始化LeRobotDataset
     if dataset_type == "lerobot":
         from dataset.lerobot_dataset_pretrain_mp import LeRobotDataset 
         import yaml
+        # config.get("dataset_config_path"): 获取dataset_config_path字段的值，如果不存在则返回None
         with open(config.get("dataset_config_path"), 'r') as f:
             dataset_config = yaml.safe_load(f)
 
@@ -168,9 +185,15 @@ def prepare_dataset(config: dict) -> torch.utils.data.Dataset:
 
 
 def prepare_dataloader(dataset, config: dict) -> DataLoader:
+    # 相当于规定了dataloader的batch_size和num_workers
     batch_size = get_with_warning(config, "batch_size", 8)
     num_workers = get_with_warning(config, "num_workers", 8)
 
+    # shuffle: 每个epoch是否打乱数据
+    # num_workers: 加载数据的子进程数
+    # pin_memory: 是否将数据加载到固定内存中以加速GPU访问
+    # drop_last: 是否丢弃最后一个不完整的batch
+    # collate_fn: 用于合并样本的函数,使用custom_collate_fn来处理不同长度的图像和文本输入
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -288,7 +311,7 @@ def load_checkpoint_with_deepspeed(model_engine, load_dir, accelerator, tag="ste
             raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {load_dir} with tag {tag}: {str(e2)}")
 
     
-
+# 该函数用于获取当前模型的梯度范数，并对梯度进行裁剪以防止梯度爆炸。它首先检查 Accelerate 是否提供了全局梯度范数的计算和裁剪方法，如果有则直接使用；否则，它会手动计算每个参数的梯度范数，进行裁剪，并返回裁剪前后的总范数。这种方式确保了在不同的训练环境下都能正确地处理梯度裁剪，从而提高训练的稳定性。
 def get_and_clip_grad_norm(accelerator, model, loss, max_norm: float = 1.0):
 
     if hasattr(accelerator, "get_global_grad_norm") and hasattr(accelerator, "clip_grad_norm_"):
@@ -315,6 +338,14 @@ def get_and_clip_grad_norm(accelerator, model, loss, max_norm: float = 1.0):
     return total_norm, clipped_norm
 
 def build_param_groups(model, wd):
+    '''
+    this function separates model parameters into two groups: 
+        those that should have weight decay applied (decay) and those that should not (no_decay).
+    通常来说，权重衰减（weight decay）不应该应用于偏置参数（bias）和归一化层（如 LayerNorm）的参数，因为它们对模型的稳定性和性能有重要影响。这个函数通过检查参数名称和维度来区分这两类参数，并为它们创建不同的优化器参数组，以便在训练过程中正确地应用权重衰减。
+     - decay: 包含需要应用权重衰减的参数（通常是权重参数）
+     - no_decay: 包含不需要应用权重衰减的参数（如偏置和归一化层参数）
+     - 最后返回一个列表，其中每个元素都是一个字典，指定了参数组和对应的权重衰减值。这种分组方式允许优化器在更新参数时正确地应用权重衰减，从而提高模型的训练效果和泛化能力。
+    '''
     decay, no_decay = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad: 
@@ -328,7 +359,7 @@ def build_param_groups(model, wd):
 def train(config):
 
 
-    # === Set logging ===
+    # === Set logging === 
     save_dir = get_with_warning(config, "save_dir", "checkpoints")
     log_path = setup_logging(save_dir)
     
@@ -338,6 +369,7 @@ def train(config):
 
     # === Debug mode ===
     if get_with_warning(config, "debug", False):
+        # Debug 模式下开启 autograd 异常检测，帮助定位 NaN/Inf 问题
         torch.autograd.set_detect_anomaly(True)
 
     # === Dataset ===
@@ -349,9 +381,13 @@ def train(config):
     # === Model ===
     model = EVO1(config)
     model.train()
+    ## 根据 finetune_vlm / finetune_action_head 冻结参数
     model.set_finetune_flags()
-
+    
+    ## 学习率和优化器，使用 AdamW，并且根据参数是否需要衰减分为两组
     lr = get_with_warning(config, "lr", 1e-5)
+    # wd: 权重衰减，默认值1e-5，通常用于正则化，防止过拟合。
+    # AdamW优化器会对需要衰减的参数应用这个权重衰减，而不需要衰减的参数（如偏置和LayerNorm参数）则不受影响。
     wd = get_with_warning(config, "weight_decay", 1e-5)
     optimizer = AdamW(build_param_groups(model, wd), lr=lr)
     if accelerator.is_main_process:
@@ -360,7 +396,7 @@ def train(config):
 
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     model_engine = model  
-  
+    
     if accelerator.is_main_process:
         logging.info("Initialized with Accelerate")
     
@@ -440,6 +476,9 @@ def train(config):
             embodiment_ids = batch["embodiment_ids"]
             fused_tokens_list = []
             
+            # 对于每个样本，单独跑视觉语言编码，将图像、图像掩码和文本提示作为输入，获取融合后的视觉语言嵌入表示。
+            # 这里将每个样本的融合表示转换为 bfloat16 数据类型，并将它们存储在 fused_tokens_list 中。
+            # 最后，将所有样本的融合表示沿着批次维度拼接成一个大的张量 fused_tokens，作为后续模型前向传播的输入。
             for prompt, images, image_mask in zip(prompts, images_batch, image_masks):
                 fused = model.get_vl_embeddings(images=images, image_mask=image_mask, prompt=prompt, return_cls_only=False)
                 fused_tokens_list.append(fused.to(dtype=torch.bfloat16))
@@ -447,11 +486,16 @@ def train(config):
             fused_tokens = torch.cat(fused_tokens_list, dim=0)
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-
+                
+                # pred_velocity: 模型预测的动作速度
+                # noise: 模型预测的噪声
                 pred_velocity, noise = model(fused_tokens, state=states, actions_gt=actions_gt, action_mask=action_mask)
                 
+            # target_velocity: 真实动作速度，计算方式是将真实动作减去模型预测的噪声。
+            # 这个目标速度将用于与模型预测的速度进行比较，以计算流匹配损失。
             target_velocity = (actions_gt - noise).view(actions_gt.shape[0], -1)
             
+            # 确保形状一致
             assert pred_velocity.shape == target_velocity.shape
 
             if action_mask.sum() == 0:
@@ -460,10 +504,14 @@ def train(config):
                             f"action_mask shape: {action_mask.shape}, "
                             f"action_mask: {action_mask}")
             
-
+            # 计算流匹配损失
+            # 首先将 action_mask 展平并转换为与 pred_velocity 相同的数据类型
+            # 然后对 pred_velocity 应用掩码
+            # 最后计算 MSE 损失。
             action_mask = action_mask.view(action_mask.shape[0], -1).to(dtype=pred_velocity.dtype)
             pred_velocity_mask = pred_velocity * action_mask
             loss = loss_fn(pred_velocity_mask, target_velocity)
+            # 根据掩码的非零元素数量调整损失的缩放，以确保不同样本之间的损失具有可比性，避免因为有效动作数量不同而导致的损失不稳定。
             scale_factor = action_mask.numel() / (action_mask.sum() + 1e-8)
             loss = loss * scale_factor
             
